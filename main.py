@@ -23,12 +23,11 @@ try:
     from markdown_it import MarkdownIt
     from mdit_py_plugins.footnote import footnote_plugin
     from mdit_py_plugins.tasklists import tasklists_plugin
-    from mdit_py_plugins.table import table_plugin
     from mdit_py_plugins.deflist import deflist_plugin
 except ImportError as e:
     raise ImportError(
         "Missing dependency 'markdown-it-py' (and plugins). Install via: "
-        "pip install markdown-it-py mdit-py-plugins"
+        'pip install "markdown-it-py[linkify]" mdit-py-plugins'
     ) from e
 
 try:
@@ -74,13 +73,15 @@ def markdown_to_docx(markdown_text: str, output_path: str) -> str:
     text = _preprocess_markdown(markdown_text)
 
     # --- parse markdown into tokens ---
-    md = (
-        MarkdownIt("commonmark", options_update={"linkify": True, "typographer": True})
-        .use(table_plugin)
-        .use(tasklists_plugin, label=True)
-        .use(deflist_plugin)
-        .use(footnote_plugin)
+    # IMPORTANT: tables are a core rule in markdown-it-py; enable them when using "commonmark".
+    # (In older examples some used mdit_py_plugins.table, which is no longer present.)
+    md = MarkdownIt(
+        "commonmark",
+        options_update={"linkify": True, "typographer": True}
     )
+    md.enable("table")  # <- fix: ensure GFM pipe tables parse correctly
+    md = md.use(tasklists_plugin, label=True).use(deflist_plugin).use(footnote_plugin)
+
     env: Dict = {}
     tokens = md.parse(text, env)
 
@@ -135,7 +136,7 @@ def markdown_to_docx(markdown_text: str, output_path: str) -> str:
             i += 1
             continue
 
-        if t.type == "bullet_list_close" or t.type == "ordered_list_close":
+        if t.type in ("bullet_list_close", "ordered_list_close"):
             if list_stack:
                 list_stack.pop()
             i += 1
@@ -173,11 +174,9 @@ def markdown_to_docx(markdown_text: str, output_path: str) -> str:
             while k < end:
                 tk = tokens[k]
                 if tk.type in ("bullet_list_open", "ordered_list_open"):
-                    # Nested lists are handled by the main loop once we advance index
-                    pass
+                    pass  # handled by main loop when index advances
                 elif tk.type == "paragraph_open":
-                    # Already handled by main bullet text; skip the body paragraph to avoid duplication
-                    pass
+                    pass  # already handled by main bullet text
                 k += 1
 
             i = end + 1
@@ -267,7 +266,6 @@ def _preprocess_markdown(text: str) -> str:
             text = inner.strip()
 
     # Drop stray HTML tags while preserving text content (very light sanitize)
-    # This avoids raw <details>, <summary>, etc. bleeding into the doc.
     text = re.sub(r"<\s*br\s*/?\s*>", "\n", text, flags=re.I)
     text = re.sub(r"<[^>]+>", "", text)
 
@@ -309,11 +307,9 @@ def _ensure_minimum_styles(doc: Document) -> None:
 
 def _add_code_block_paragraph(doc: Document, code: str) -> None:
     p = doc.add_paragraph(style="CodeBlock")
-    # Preserve line breaks
-    lines = code.split("\n")
-    for idx, line in enumerate(lines):
+    for idx, line in enumerate(code.split("\n")):
         r = p.add_run(line)
-        if idx < len(lines) - 1:
+        if idx < len(code.split("\n")) - 1:
             r.add_break()
 
 
@@ -322,7 +318,6 @@ def _render_inlines(doc: Document, paragraph, children, seen_footnote_ids: List[
     Render inline tokens into a given paragraph.
     Handles text/emphasis/strong/strike/inline code/links/images/footnote refs/line breaks.
     """
-    # current text state toggles
     state = {"bold": False, "italic": False, "strike": False, "underline": False}
 
     i = 0
@@ -332,10 +327,7 @@ def _render_inlines(doc: Document, paragraph, children, seen_footnote_ids: List[
         if tok.type == "text":
             _add_text_run(paragraph, tok.content or "", state)
 
-        elif tok.type == "softbreak":
-            paragraph.add_run().add_break()
-
-        elif tok.type == "hardbreak":
+        elif tok.type in ("softbreak", "hardbreak"):
             paragraph.add_run().add_break()
 
         elif tok.type == "code_inline":
@@ -359,7 +351,6 @@ def _render_inlines(doc: Document, paragraph, children, seen_footnote_ids: List[
 
         elif tok.type == "link_open":
             href = tok.attrGet("href") or ""
-            # gather inner plain text
             j = i + 1
             inner_text = []
             while j < len(children) and children[j].type != "link_close":
@@ -369,12 +360,11 @@ def _render_inlines(doc: Document, paragraph, children, seen_footnote_ids: List[
                 elif cj.type == "softbreak":
                     inner_text.append("\n")
                 elif cj.type == "image":
-                    # use alt text inside link
                     inner_text.append(cj.attrGet("alt") or "")
                 j += 1
             link_text = "".join(inner_text).strip() or href
             _add_hyperlink(paragraph, href, link_text, state)
-            i = j  # skip to link_close; the loop will add +1
+            i = j  # skip to link_close
         elif tok.type == "image":
             src = tok.attrGet("src") or ""
             alt = tok.attrGet("alt") or ""
@@ -390,7 +380,6 @@ def _render_inlines(doc: Document, paragraph, children, seen_footnote_ids: List[
             r = paragraph.add_run(f"[{fid_int + 1}]")
             r.font.superscript = True
 
-        # ignore other inline types safely
         i += 1
 
 
@@ -406,17 +395,14 @@ def _add_text_run(paragraph, text: str, state: Dict[str, bool]) -> None:
 
 def _add_hyperlink(paragraph, url: str, text: str, state: Dict[str, bool]) -> None:
     """Insert a real docx hyperlink (blue & underlined), preserving bold/italic/strike."""
-    # guard against empty/invalid URLs
     url = (url or "").strip()
     if not url:
         _add_text_run(paragraph, text, state)
         return
 
-    # relationship id
     part = paragraph.part
     r_id = part.relate_to(url, RELATIONSHIP_TYPE.HYPERLINK, is_external=True)
 
-    # <w:hyperlink r:id="..."><w:r><w:rPr>...</w:rPr><w:t>text</w:t></w:r></w:hyperlink>
     hyperlink = OxmlElement("w:hyperlink")
     hyperlink.set(qn("r:id"), r_id)
 
@@ -437,7 +423,6 @@ def _add_hyperlink(paragraph, url: str, text: str, state: Dict[str, bool]) -> No
         rPr.append(OxmlElement("w:strike"))
 
     t = OxmlElement("w:t")
-    # Ensure xml preserves whitespace if needed
     t.set(qn("xml:space"), "preserve")
     t.text = text
 
@@ -455,7 +440,6 @@ def _add_image_block(doc: Document, src: str, alt: str, paragraph_after: bool = 
     img_bytes: Optional[BytesIO] = None
     try:
         if src.startswith("data:image/"):
-            # data URI
             comma = src.find(",")
             if comma != -1:
                 b64 = src[comma + 1 :]
@@ -466,7 +450,6 @@ def _add_image_block(doc: Document, src: str, alt: str, paragraph_after: bool = 
                 resp.raise_for_status()
                 img_bytes = BytesIO(resp.content)
         else:
-            # local file path
             if os.path.exists(src) and os.path.isfile(src):
                 with open(src, "rb") as f:
                     img_bytes = BytesIO(f.read())
@@ -474,15 +457,13 @@ def _add_image_block(doc: Document, src: str, alt: str, paragraph_after: bool = 
         img_bytes = None
 
     if img_bytes:
-        pic = doc.add_picture(img_bytes)  # natural size; or use width=Inches(6)
-        # (Optional) add a caption-like line using alt text
+        doc.add_picture(img_bytes)  # natural size
         if alt:
             p = doc.add_paragraph()
             p.add_run(alt).italic = True
         if paragraph_after:
             doc.add_paragraph()
     else:
-        # graceful fallback: text with URL
         p = doc.add_paragraph()
         fallback = alt.strip() or "Image"
         p.add_run(fallback + " ").italic = True
@@ -504,7 +485,6 @@ def _maybe_render_task_marker_prefix(paragraph, inline_token) -> None:
     if m:
         checked = m.group(1).lower() == "x"
         paragraph.add_run("☑ " if checked else "☐ ")
-        # trim the marker from the first text node
         children[0].content = txt[m.end() :]
 
 
@@ -521,7 +501,6 @@ def _consume_table(tokens, i: int, doc: Document) -> int:
     Parse a markdown-it table starting at tokens[i] == 'table_open' and append a docx table.
     Returns the index right after 'table_close'.
     """
-    # Extract rows (header + body) as plain text
     headers: List[str] = []
     rows: List[List[str]] = []
 
@@ -530,7 +509,6 @@ def _consume_table(tokens, i: int, doc: Document) -> int:
         t = tokens[k]
 
         if t.type == "thead_open":
-            # one header row (tr)
             k += 1
             while tokens[k].type != "thead_close":
                 if tokens[k].type == "tr_open":
@@ -538,7 +516,6 @@ def _consume_table(tokens, i: int, doc: Document) -> int:
                     row: List[str] = []
                     while tokens[k].type != "tr_close":
                         if tokens[k].type == "th_open":
-                            # th_open -> inline -> th_close
                             inline = tokens[k + 1]
                             row.append(_inline_text(inline.children or []))
                             k += 3
@@ -573,7 +550,6 @@ def _consume_table(tokens, i: int, doc: Document) -> int:
 
         k += 1
 
-    # Build the docx table
     cols = max(len(headers), max((len(r) for r in rows), default=0))
     cols = max(cols, 1)
     table = doc.add_table(rows=(1 if headers else 0) + len(rows), cols=cols)
@@ -594,7 +570,6 @@ def _consume_table(tokens, i: int, doc: Document) -> int:
             cell.text = row[c] if c < len(row) else ""
         r += 1
 
-    # return index after 'table_close'
     while i < len(tokens) and tokens[i].type != "table_close":
         i += 1
     return i + 1
@@ -616,7 +591,6 @@ def _consume_deflist(tokens, i: int, doc: Document, md: MarkdownIt) -> int:
             k += 3  # dt_open, inline, dt_close
             continue
         if t.type == "dd_open":
-            # the dd can contain multiple paragraphs/blocks before dd_close
             k += 1
             parts: List[str] = []
             while tokens[k].type != "dd_close":
@@ -624,7 +598,6 @@ def _consume_deflist(tokens, i: int, doc: Document, md: MarkdownIt) -> int:
                     parts.append(_inline_text(tokens[k + 1].children or []))
                     k += 3
                 else:
-                    # Fallback: try to serialize anything else
                     if tokens[k].type == "inline":
                         parts.append(_inline_text(tokens[k].children or []))
                     k += 1
@@ -633,11 +606,10 @@ def _consume_deflist(tokens, i: int, doc: Document, md: MarkdownIt) -> int:
             if current_term:
                 p.add_run(f"{current_term}: ").bold = True
             p.add_run(definition)
-            k += 1  # past dd_close
+            k += 1
             continue
         k += 1
 
-    # return index after 'dl_close'
     while i < len(tokens) and tokens[i].type != "dl_close":
         i += 1
     return i + 1
@@ -689,12 +661,10 @@ def _consume_footnote_block(tokens, i: int, footnote_defs: Dict[int, str], md: M
             buffer.append(_inline_text(tokens[k + 1].children or []))
             k += 3
             continue
-        # Other blocks inside footnotes (rare): just skip or flatten
         if t.type == "inline":
             buffer.append(_inline_text(t.children or []))
         k += 1
 
-    # return index after block close
     while i < len(tokens) and tokens[i].type != "footnote_block_close":
         i += 1
     return i + 1
