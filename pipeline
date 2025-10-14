@@ -1,46 +1,156 @@
-# tools/get_refresh_token_once.py (run locally)
-import os, json, webbrowser
-from http.server import HTTPServer, BaseHTTPRequestHandler
-from urllib.parse import urlparse, parse_qs
-from google_auth_oauthlib.flow import Flow
+# app/rag_pipeline.py
+# Core pipeline utilities: validate payload, build JSONL, write to GCS, import to RAG.
 
-PORT = 8080
-REDIRECT_URI = f"http://localhost:{PORT}/oauth2callback"
-SCOPES = [
-  "https://www.googleapis.com/auth/drive.readonly",
-  "https://www.googleapis.com/auth/spreadsheets.readonly",
-]
+from __future__ import annotations
+import hashlib
+import json
+import logging
+import os
+from typing import Dict, List, Tuple
 
-# Create a OAuth client in Cloud Console and place the JSON here or load from env/secret
-CLIENT_ID = "<YOUR_CLIENT_ID>"
-CLIENT_SECRET = "<YOUR_CLIENT_SECRET>"
+from google.cloud import storage
+import vertexai
+from vertexai import rag  # GA in google-cloud-aiplatform >= 1.110
+from tenacity import retry, stop_after_attempt, wait_exponential
 
-flow = Flow.from_client_config({
-  "installed": {
-    "client_id": CLIENT_ID,
-    "client_secret": CLIENT_SECRET,
-    "redirect_uris": [REDIRECT_URI],
-    "auth_uri": "https://accounts.google.com/o/oauth2/auth",
-    "token_uri": "https://oauth2.googleapis.com/token"
-  }
-}, scopes=SCOPES, redirect_uri=REDIRECT_URI)
+log = logging.getLogger(__name__)
 
-auth_url, _ = flow.authorization_url(access_type="offline", include_granted_scopes="true", prompt="consent")
+PROJECT_ID = os.environ["PROJECT_ID"]
+LOCATION = os.environ.get("LOCATION", "us-central1")
 
-class Handler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        q = parse_qs(urlparse(self.path).query)
-        if self.path.startswith("/oauth2callback") and "code" in q:
-            flow.fetch_token(code=q["code"][0])
-            creds = flow.credentials
-            print("\nREFRESH TOKEN:", creds.refresh_token, "\n")
-            self.send_response(200)
-            self.end_headers()
-            self.wfile.write(b"You may close this tab.")
-        else:
-            self.send_response(404); self.end_headers()
+GCS_BUCKET = os.environ["GCS_BUCKET"]
+GCS_OBJECT = os.environ.get("GCS_OBJECT", "rag/acronyms.jsonl")  # single file target
+GCS_URI = f"gs://{GCS_BUCKET}/{GCS_OBJECT}"
 
-print("Open:", auth_url)
-webbrowser.open(auth_url)
+RAG_CORPUS_NAME = os.environ["RAG_CORPUS_NAME"]  # projects/{p}/locations/{l}/ragCorpora/{id}
+RAG_CHUNK_SIZE = int(os.environ.get("RAG_CHUNK_SIZE", "512"))
+RAG_CHUNK_OVERLAP = int(os.environ.get("RAG_CHUNK_OVERLAP", "64"))
 
-HTTPServer(("localhost", PORT), Handler).serve_forever()
+MAX_JSONL_BYTES = 10 * 1024 * 1024  # RAG JSONL per-file size limit (10 MB). :contentReference[oaicite:1]{index=1}
+
+def _canonicalize_rows(values: List[List[str]], has_header: bool) -> List[Dict[str, str]]:
+    """Accepts a 2D array of cells. Preferred format is 2 columns [acronym, definition].
+    Also tolerates alternating single-column lines. Deduplicates by acronym (last wins)."""
+    rows = values[1:] if (has_header and values) else values
+    if not rows:
+        return []
+
+    two_cols_majority = sum(1 for r in rows if len(r) >= 2) >= max(1, int(0.6 * len(rows)))
+    items: List[Dict[str, str]] = []
+
+    if two_cols_majority:
+        for r in rows:
+            if len(r) < 2:
+                continue
+            a = (r[0] or "").strip()
+            d = (r[1] or "").strip()
+            if a and d:
+                items.append({"acronym": a, "definition": d})
+    else:
+        # Alternating single-column lines
+        buf = [("".join(r)).strip() for r in rows if any(c.strip() for c in r)]
+        for i in range(0, len(buf), 2):
+            if i + 1 >= len(buf):
+                break
+            a = buf[i].strip()
+            d = buf[i + 1].strip()
+            if a and d:
+                items.append({"acronym": a, "definition": d})
+
+    # Deduplicate by acronym (last definition wins)
+    dmap: Dict[str, str] = {}
+    for it in items:
+        dmap[it["acronym"]] = it["definition"]
+
+    # stable sort by acronym (case-insensitive)
+    return [{"acronym": k, "definition": v} for k, v in sorted(dmap.items(), key=lambda t: t[0].lower())]
+
+def _to_jsonl_bytes(records: List[Dict[str, str]]) -> bytes:
+    return ("\n".join(json.dumps(r, ensure_ascii=False) for r in records) + "\n").encode("utf-8")
+
+def _compute_source_hash(records: List[Dict[str, str]]) -> str:
+    # Simple, stable hash across (acronym \t definition \n)
+    h = hashlib.sha256()
+    for r in records:
+        h.update((r["acronym"] + "\t" + r["definition"] + "\n").encode("utf-8"))
+    return h.hexdigest()
+
+def _get_existing_source_hash(client: storage.Client, bucket: str, object_name: str) -> str | None:
+    b = client.bucket(bucket)
+    blob = b.blob(object_name)
+    if not blob.exists():
+        return None
+    blob.reload()
+    md = (blob.metadata or {})
+    return md.get("source_hash")
+
+@retry(reraise=True, stop=stop_after_attempt(5), wait=wait_exponential(multiplier=1, min=1, max=30))
+def _upload_jsonl(data: bytes, source_hash: str) -> Tuple[str, int]:
+    client = storage.Client()
+    b = client.bucket(GCS_BUCKET)
+    blob = b.blob(GCS_OBJECT)
+    blob.content_type = "application/x-ndjson"
+    blob.cache_control = "no-store"
+    blob.metadata = (blob.metadata or {})
+    blob.metadata["source_hash"] = source_hash
+    blob.upload_from_string(data)
+    blob.reload()
+    return blob.etag, int(blob.generation)
+
+@retry(reraise=True, stop=stop_after_attempt(5), wait=wait_exponential(multiplier=1, min=1, max=60))
+def _import_to_rag(gcs_uri: str) -> Dict:
+    vertexai.init(project=PROJECT_ID, location=LOCATION)
+    resp = rag.import_files(
+        corpus_name=RAG_CORPUS_NAME,
+        paths=[gcs_uri],
+        transformation_config=rag.TransformationConfig(
+            rag.ChunkingConfig(chunk_size=RAG_CHUNK_SIZE, chunk_overlap=RAG_CHUNK_OVERLAP)
+        ),
+        max_embedding_requests_per_min=900,
+    )
+    # API returns counts for imported/skipped files.
+    return {
+        "imported_count": getattr(resp, "imported_rag_files_count", None),
+        "skipped_count": getattr(resp, "skipped_rag_files_count", None),
+    }
+
+def run_pipeline(payload: Dict) -> Dict:
+    """
+    Expects payload:
+    {
+      "spreadsheetId": "...",
+      "sheetName": "Acronyms",
+      "range": "A:B",
+      "hasHeader": true,
+      "values": [["ACR","Definition"],["AI","Artificial Intelligence"], ...],
+      "sourceHash": "optional client-side hash"
+    }
+    """
+    values = payload.get("values") or []
+    has_header = bool(payload.get("hasHeader", True))
+
+    records = _canonicalize_rows(values, has_header)
+    if not records:
+        log.info("No records detected; skipping upload & import.")
+        return {"records": 0, "skipped": True, "reason": "empty"}
+
+    jsonl = _to_jsonl_bytes(records)
+    if len(jsonl) > MAX_JSONL_BYTES:
+        # Typically this list is tiny. If you ever exceed 10 MB, split logic belongs here.
+        raise ValueError(f"JSONL exceeds {MAX_JSONL_BYTES} bytes limit for RAG JSONL files.")
+
+    source_hash = payload.get("sourceHash") or _compute_source_hash(records)
+    existing_hash = _get_existing_source_hash(storage.Client(), GCS_BUCKET, GCS_OBJECT)
+    if existing_hash == source_hash:
+        log.info("Source unchanged; skipping upload & import.")
+        return {"records": len(records), "skipped": True, "reason": "unchanged"}
+
+    etag, generation = _upload_jsonl(jsonl, source_hash)
+    rag_result = _import_to_rag(GCS_URI)
+    return {
+        "records": len(records),
+        "gcs_uri": GCS_URI,
+        "gcs_generation": generation,
+        "etag": etag,
+        "rag_import": rag_result,
+    }
