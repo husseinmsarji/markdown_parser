@@ -1,303 +1,46 @@
-# app/main.py
-# Production-grade Cloud Run receiver for Google Drive push notifications
-# Converts a Google Sheet (Acronym | Definition) to JSONL in GCS and imports into Vertex AI RAG Engine.
-#
-# Key features:
-# - OAuth 2.0 (3LO) for Sheets/Drive using refresh token stored in Secret Manager
-# - Idempotent RAG import (skips unchanged files automatically)
-# - Defensive parsing (supports [Acronym, Definition] columns OR alternating rows)
-# - Strong logging, retries, and input validation
-# - Endpoints: /healthz, /ready, /drive/webhook, /register_watch (for daily renewal), /reindex
+# tools/get_refresh_token_once.py (run locally)
+import os, json, webbrowser
+from http.server import HTTPServer, BaseHTTPRequestHandler
+from urllib.parse import urlparse, parse_qs
+from google_auth_oauthlib.flow import Flow
 
-import os
-import json
-import logging
-import time
-import uuid
-from typing import List, Dict, Tuple
-
-from flask import Flask, request, jsonify, abort
-
-import google.auth
-from google.cloud import storage, secretmanager, logging as cloud_logging
-from google.oauth2.credentials import Credentials
-from googleapiclient.discovery import build
-from googleapiclient.errors import HttpError
-from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
-
-# Vertex AI SDK (rag.import_files)
-import vertexai
-from vertexai import rag  # Available in google-cloud-aiplatform>=1.110
-# Doc reference: https://cloud.google.com/vertex-ai/generative-ai/docs/model-reference/rag-api-v1
-
-# --- Bootstrap logging (Cloud Logging handler)
-cloud_logging.Client().setup_logging(log_level=logging.INFO)
-log = logging.getLogger("acronym-pipeline")
-
-app = Flask(__name__)
-
-# -------- Environment (configure via Cloud Run) --------
-PROJECT_ID = os.environ["PROJECT_ID"]
-LOCATION = os.environ.get("LOCATION", "us-central1")
-
-SPREADSHEET_ID = os.environ["SPREADSHEET_ID"]             # The Google Sheet to watch
-SHEET_RANGE = os.environ.get("SHEET_RANGE", "A:B")        # Expected [Acronym, Definition]
-HAS_HEADER = os.environ.get("HAS_HEADER", "true").lower() == "true"
-
-GCS_BUCKET = os.environ["GCS_BUCKET"]
-GCS_OBJECT = os.environ.get("GCS_OBJECT", "rag/acronyms.jsonl")
-GCS_URI = f"gs://{GCS_BUCKET}/{GCS_OBJECT}"
-
-RAG_CORPUS_NAME = os.environ["RAG_CORPUS_NAME"]           # projects/{project}/locations/{loc}/ragCorpora/{id}
-RAG_CHUNK_SIZE = int(os.environ.get("RAG_CHUNK_SIZE", "512"))
-RAG_CHUNK_OVERLAP = int(os.environ.get("RAG_CHUNK_OVERLAP", "64"))
-
-# Drive push channel verification token (store in Secret Manager recommended)
-CHANNEL_TOKEN_SECRET = os.environ.get("CHANNEL_TOKEN_SECRET", "projects/{}/secrets/drive_channel_token/versions/latest".format(PROJECT_ID))
-
-# OAuth client + refresh token secrets (3LO)
-OAUTH_CLIENT_ID_SECRET = os.environ.get("OAUTH_CLIENT_ID_SECRET", f"projects/{PROJECT_ID}/secrets/OAUTH_CLIENT_ID/versions/latest")
-OAUTH_CLIENT_SECRET_SECRET = os.environ.get("OAUTH_CLIENT_SECRET_SECRET", f"projects/{PROJECT_ID}/secrets/OAUTH_CLIENT_SECRET/versions/latest")
-OAUTH_REFRESH_TOKEN_SECRET = os.environ.get("OAUTH_REFRESH_TOKEN_SECRET", f"projects/{PROJECT_ID}/secrets/OAUTH_REFRESH_TOKEN/versions/latest")
-
-# OAuth scopes for read-only access
+PORT = 8080
+REDIRECT_URI = f"http://localhost:{PORT}/oauth2callback"
 SCOPES = [
-    "https://www.googleapis.com/auth/drive.readonly",
-    "https://www.googleapis.com/auth/spreadsheets.readonly",
+  "https://www.googleapis.com/auth/drive.readonly",
+  "https://www.googleapis.com/auth/spreadsheets.readonly",
 ]
 
-# Retry policy for transient Google API errors
-RETRYABLE = (HttpError,)
+# Create a OAuth client in Cloud Console and place the JSON here or load from env/secret
+CLIENT_ID = "<YOUR_CLIENT_ID>"
+CLIENT_SECRET = "<YOUR_CLIENT_SECRET>"
 
-def secret_value(resource: str) -> str:
-    sm = secretmanager.SecretManagerServiceClient()
-    name = resource
-    if "/versions/" not in name:
-        name = f"{resource}/versions/latest"
-    payload = sm.access_secret_version(request={"name": name}).payload.data.decode("utf-8")
-    return payload.strip()
+flow = Flow.from_client_config({
+  "installed": {
+    "client_id": CLIENT_ID,
+    "client_secret": CLIENT_SECRET,
+    "redirect_uris": [REDIRECT_URI],
+    "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+    "token_uri": "https://oauth2.googleapis.com/token"
+  }
+}, scopes=SCOPES, redirect_uri=REDIRECT_URI)
 
-def user_oauth_credentials() -> Credentials:
-    """
-    Build user OAuth credentials from refresh token + client secret in Secret Manager.
-    Tokens are refreshed automatically by google-auth.
-    """
-    client_id = secret_value(OAUTH_CLIENT_ID_SECRET)
-    client_secret = secret_value(OAUTH_CLIENT_SECRET_SECRET)
-    refresh_token = secret_value(OAUTH_REFRESH_TOKEN_SECRET)
+auth_url, _ = flow.authorization_url(access_type="offline", include_granted_scopes="true", prompt="consent")
 
-    creds = Credentials(
-        token=None,
-        refresh_token=refresh_token,
-        token_uri="https://oauth2.googleapis.com/token",
-        client_id=client_id,
-        client_secret=client_secret,
-        scopes=SCOPES,
-    )
-    return creds
+class Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        q = parse_qs(urlparse(self.path).query)
+        if self.path.startswith("/oauth2callback") and "code" in q:
+            flow.fetch_token(code=q["code"][0])
+            creds = flow.credentials
+            print("\nREFRESH TOKEN:", creds.refresh_token, "\n")
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"You may close this tab.")
+        else:
+            self.send_response(404); self.end_headers()
 
-def build_sheets_service(creds: Credentials):
-    return build("sheets", "v4", credentials=creds, cache_discovery=False)
+print("Open:", auth_url)
+webbrowser.open(auth_url)
 
-def build_drive_service(creds: Credentials):
-    return build("drive", "v3", credentials=creds, cache_discovery=False)
-
-@retry(reraise=True, stop=stop_after_attempt(5), wait=wait_exponential(multiplier=1, min=1, max=30), retry=retry_if_exception_type(RETRYABLE))
-def read_sheet() -> List[List[str]]:
-    """Reads the configured sheet range and returns raw rows."""
-    creds = user_oauth_credentials()
-    service = build_sheets_service(creds)
-    result = service.spreadsheets().values().get(
-        spreadsheetId=SPREADSHEET_ID,
-        range=SHEET_RANGE,
-        majorDimension="ROWS"
-    ).execute()
-    values = result.get("values", [])
-    return values
-
-def parse_acronyms(rows: List[List[str]]) -> List[Dict[str, str]]:
-    """
-    Accept either:
-    - 2 columns: [Acronym, Definition]
-    - OR single column lines alternating Acronym, Definition
-    Skips empty lines and (optionally) header row.
-    """
-    data: List[Dict[str, str]] = []
-    work = rows[1:] if (HAS_HEADER and len(rows) > 0) else rows
-
-    # Heuristic: if most rows have >=2 cells, treat first two as acronym/definition
-    two_cols = sum(1 for r in work if len(r) >= 2) >= max(1, int(0.6 * len(work)))  # tolerate sparse rows
-
-    if two_cols:
-        for r in work:
-            if len(r) < 2:
-                continue
-            a = (r[0] or "").strip()
-            d = (r[1] or "").strip()
-            if not a or not d:
-                continue
-            data.append({"acronym": a, "definition": d})
-    else:
-        # Alternate lines: Acronym on odd, Definition on even
-        buf: List[str] = [("".join(r)).strip() for r in work if any(cell.strip() for cell in r)]
-        for i in range(0, len(buf), 2):
-            try:
-                a = (buf[i] or "").strip()
-                d = (buf[i + 1] or "").strip()
-            except IndexError:
-                break
-            if a and d:
-                data.append({"acronym": a, "definition": d})
-
-    # Deduplicate by acronym (last wins)
-    dedup = {}
-    for item in data:
-        dedup[item["acronym"]] = item["definition"]
-    return [{"acronym": k, "definition": v} for k, v in sorted(dedup.items(), key=lambda t: t[0].lower())]
-
-def to_jsonl(records: List[Dict[str, str]]) -> bytes:
-    return ("\n".join(json.dumps(r, ensure_ascii=False) for r in records) + "\n").encode("utf-8")
-
-@retry(reraise=True, stop=stop_after_attempt(5), wait=wait_exponential(multiplier=1, min=1, max=30))
-def upload_to_gcs(data: bytes, bucket: str, object_name: str) -> Tuple[str, int]:
-    """
-    Uploads JSONL to GCS. Returns (etag, generation) for caching/idempotency.
-    """
-    client = storage.Client()
-    b = client.bucket(bucket)
-    blob = b.blob(object_name)
-    # Overwrite; add content-type for clarity
-    blob.content_type = "application/x-ndjson"
-    blob.cache_control = "no-store"
-    blob.upload_from_string(data)
-    blob.reload()  # populate metadata
-    return blob.etag, int(blob.generation)
-
-@retry(reraise=True, stop=stop_after_attempt(5), wait=wait_exponential(multiplier=1, min=1, max=60), retry=retry_if_exception_type(Exception))
-def import_into_rag(gcs_uri: str) -> Dict:
-    """
-    Calls Vertex AI RAG Engine to import the JSONL file.
-    Import is idempotent; unchanged files are skipped by the API.
-    """
-    vertexai.init(project=PROJECT_ID, location=LOCATION)
-    # Docs: rag.import_files(..., transformation_config=rag.TransformationConfig(...))
-    # https://cloud.google.com/vertex-ai/generative-ai/docs/model-reference/rag-api-v1
-    resp = rag.import_files(
-        corpus_name=RAG_CORPUS_NAME,
-        paths=[gcs_uri],
-        transformation_config=rag.TransformationConfig(
-            rag.ChunkingConfig(chunk_size=RAG_CHUNK_SIZE, chunk_overlap=RAG_CHUNK_OVERLAP)
-        ),
-        # Optional rate limiter if embedding QPM is an issue:
-        max_embedding_requests_per_min=900
-    )
-    # resp provides counts and metadata including skipped files
-    return {
-        "imported_count": getattr(resp, "imported_rag_files_count", None),
-        "skipped_count": getattr(resp, "skipped_rag_files_count", None),
-    }
-
-def process_pipeline() -> Dict:
-    """
-    Main pipeline: read sheet ➜ parse ➜ write JSONL ➜ RAG import.
-    Returns summary dict for logging.
-    """
-    rows = read_sheet()
-    records = parse_acronyms(rows)
-    payload = to_jsonl(records)
-    etag, generation = upload_to_gcs(payload, GCS_BUCKET, GCS_OBJECT)
-    rag_result = import_into_rag(GCS_URI)
-    summary = {
-        "records": len(records),
-        "gcs_uri": GCS_URI,
-        "gcs_generation": generation,
-        "etag": etag,
-        "rag_import": rag_result,
-    }
-    log.info("Pipeline complete", extra={"summary": summary})
-    return summary
-
-# -------------------- HTTP Endpoints --------------------
-
-@app.route("/healthz", methods=["GET"])
-def healthz():
-    return "ok", 200
-
-@app.route("/ready", methods=["GET"])
-def ready():
-    # Optionally verify secrets and env presence
-    try:
-        _ = PROJECT_ID and SPREADSHEET_ID and GCS_BUCKET and RAG_CORPUS_NAME
-        return "ready", 200
-    except Exception:
-        return "not ready", 500
-
-@app.route("/drive/webhook", methods=["POST"])
-def drive_webhook():
-    """
-    Receives Google Drive push notifications (files.watch on target spreadsheet).
-    Validates channel token; quickly triggers pipeline.
-    """
-    # Validate channel token
-    expected_token = secret_value(CHANNEL_TOKEN_SECRET)
-    received_token = request.headers.get("X-Goog-Channel-Token", "")
-    if expected_token and received_token != expected_token:
-        log.warning("Invalid channel token", extra={"got": received_token})
-        abort(403)
-
-    # We can inspect headers to recognize event types; 'sync' means start-up, safe to ignore.
-    resource_state = request.headers.get("X-Goog-Resource-State", "unknown")
-    message_num = request.headers.get("X-Goog-Message-Number", "n/a")
-    log.info("Drive webhook event", extra={"state": resource_state, "msg": message_num})
-
-    if resource_state == "sync":
-        return "", 200
-
-    # Optional dedup: if needed, store message number with a short TTL (e.g., Redis/Memorystore).
-    # For brevity we run the pipeline inline; keep requests under Cloud Run timeout (default 5m).
-    try:
-        summary = process_pipeline()
-        return jsonify(summary), 200
-    except Exception as e:
-        log.exception("Pipeline failed")
-        abort(500, description=str(e))
-
-@app.route("/register_watch", methods=["POST"])
-def register_watch():
-    """
-    Registers (or renews) a Drive push channel on the specific spreadsheet file.
-    Invoke daily from Cloud Scheduler to keep the channel active (< 24h expiry).
-    """
-    creds = user_oauth_credentials()
-    drive = build_drive_service(creds)
-
-    channel_id = str(uuid.uuid4())
-    address = os.environ["WEBHOOK_URL"]  # public HTTPS URL of /drive/webhook endpoint
-
-    body = {
-        "id": channel_id,
-        "type": "web_hook",
-        "address": address,
-        "token": secret_value(CHANNEL_TOKEN_SECRET),
-        # Optional expiration millis; Drive caps file watch ≤ 24h. We'll renew daily anyway.
-    }
-
-    try:
-        resp = drive.files().watch(fileId=SPREADSHEET_ID, body=body).execute()
-        log.info("Registered Drive watch", extra={"response": resp})
-        return jsonify({"status": "ok", "channel_id": resp.get("id"), "expires": resp.get("expiration")}), 200
-    except HttpError as e:
-        log.exception("Failed to register watch")
-        abort(500, description=str(e))
-
-@app.route("/reindex", methods=["POST"])
-def manual_reindex():
-    """
-    Manual trigger: rebuild JSONL and re-import (useful for backfills/testing).
-    """
-    try:
-        summary = process_pipeline()
-        return jsonify(summary), 200
-    except Exception as e:
-        log.exception("Manual reindex failed")
-        abort(500, description=str(e))
+HTTPServer(("localhost", PORT), Handler).serve_forever()
