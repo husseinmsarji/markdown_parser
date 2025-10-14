@@ -1,50 +1,128 @@
-# app/main.py
-# Flask app for Cloud Run. Private service; Apps Script must present a Google-signed ID token (aud=Cloud Run URL).
-# Cloud Run itself enforces auth; we just validate and process the JSON.
+/**
+ * Apps Script bound to your spreadsheet.
+ * On every change, read A:B and POST to Cloud Run /ingest with an OIDC ID token minted
+ * via the IAM Credentials API (no API keys, no refresh tokens).
+ *
+ * Security:
+ * - Cloud Run is private (--no-allow-unauthenticated).
+ * - This script mints a short-lived ID token for SERVICE_ACCOUNT_EMAIL and passes it in
+ *   Authorization: Bearer <id_token>. The SA must have roles/run.invoker on the service.
+ * - The executing user/group must have iam.serviceAccountTokenCreator on that SA.
+ *
+ * Scopes (see appsscript.json):
+ * - https://www.googleapis.com/auth/script.external_request  (UrlFetchApp)
+ * - https://www.googleapis.com/auth/cloud-platform           (call IAM Credentials API)
+ */
 
-import logging
-import os
-from flask import Flask, jsonify, request, abort
+const CONFIG = {
+  // Cloud Run default URL (no custom domain; audience must be service URL). :contentReference[oaicite:5]{index=5}
+  CLOUD_RUN_URL: 'https://<your-service>-<hash>-<region>.a.run.app',
+  INGEST_PATH: '/ingest',
 
-from google.cloud import logging as cloud_logging
-from tenacity import retry, stop_after_attempt, wait_exponential
+  // Service account to impersonate for ID token minting
+  SERVICE_ACCOUNT_EMAIL: 'sa-apps-script-invoker@<PROJECT_ID>.iam.gserviceaccount.com',
 
-from app.rag_pipeline import run_pipeline
+  // Sheet settings
+  SHEET_NAME: 'Acronyms', // or leave null to use active sheet
+  RANGE: 'A:B',
+  HAS_HEADER: true,
 
-# Cloud Logging setup
-cloud_logging.Client().setup_logging(log_level=logging.INFO)
-log = logging.getLogger("acronym-rag")
+  // Debounce settings to avoid bursts (ms)
+  MIN_INTERVAL_MS: 8000,
+};
 
-app = Flask(__name__)
+function onOpen() {
+  SpreadsheetApp.getUi().createMenu('Acronym RAG').addItem('Install On‑Change Trigger', 'installTrigger').addToUi();
+}
 
-@app.get("/healthz")
-def healthz():
-    return "ok", 200
+function installTrigger() {
+  // Remove previous triggers
+  ScriptApp.getProjectTriggers().forEach(t => ScriptApp.deleteTrigger(t));
+  // Install "On change" trigger
+  ScriptApp.newTrigger('onChange').forSpreadsheet(SpreadsheetApp.getActive()).onChange().create();
+  SpreadsheetApp.getActive().toast('On‑Change trigger installed.');
+}
 
-@app.get("/ready")
-def ready():
-    required = ["PROJECT_ID", "GCS_BUCKET", "RAG_CORPUS_NAME"]
-    missing = [k for k in required if not os.environ.get(k)]
-    return ("ready", 200) if not missing else (f"missing env: {missing}", 500)
+function onChange(e) {
+  try {
+    // Simple debounce via script properties
+    const props = PropertiesService.getScriptProperties();
+    const now = Date.now();
+    const last = Number(props.getProperty('lastRunTs') || '0');
+    if (now - last < CONFIG.MIN_INTERVAL_MS) {
+      return;
+    }
+    props.setProperty('lastRunTs', String(now));
 
-@retry(reraise=True, stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=10))
-def _process(payload: dict) -> dict:
-    return run_pipeline(payload)
+    notifyCloudRun_();
+  } catch (err) {
+    console.error(err);
+  }
+}
 
-@app.post("/ingest")
-def ingest():
-    # If Cloud Run is deployed with --no-allow-unauthenticated, all requests here already present a valid ID token
-    # with aud=<service URL> and subject = the invoker service account. Cloud Run checks roles/run.invoker. :contentReference[oaicite:2]{index=2}
-    try:
-        payload = request.get_json(force=True, silent=False)
-    except Exception:
-        abort(400, "Invalid JSON body")
-    if not isinstance(payload, dict):
-        abort(400, "Payload must be a JSON object")
+function notifyCloudRun_() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sheet = CONFIG.SHEET_NAME ? ss.getSheetByName(CONFIG.SHEET_NAME) : ss.getActiveSheet();
+  if (!sheet) throw new Error('Sheet not found: ' + CONFIG.SHEET_NAME);
 
-    try:
-        result = _process(payload)
-        return jsonify(result), 200
-    except Exception as e:
-        log.exception("Pipeline failure")
-        abort(500, str(e))
+  const range = sheet.getRange(CONFIG.RANGE);
+  const values = range.getValues(); // 2D array
+
+  // Optional: client-side hash to help server skip work
+  const sourceHash = sha256_(values);
+
+  const body = {
+    spreadsheetId: ss.getId(),
+    sheetName: sheet.getName(),
+    range: CONFIG.RANGE,
+    hasHeader: CONFIG.HAS_HEADER,
+    values: values,
+    sourceHash: sourceHash,
+    ts: new Date().toISOString(),
+  };
+
+  const idToken = generateIdTokenForCloudRun_(CONFIG.SERVICE_ACCOUNT_EMAIL, CONFIG.CLOUD_RUN_URL);
+  const url = CONFIG.CLOUD_RUN_URL + CONFIG.INGEST_PATH;
+
+  const resp = UrlFetchApp.fetch(url, {
+    method: 'post',
+    contentType: 'application/json',
+    payload: JSON.stringify(body),
+    headers: { 'Authorization': 'Bearer ' + idToken },
+    muteHttpExceptions: true,
+  });
+
+  if (resp.getResponseCode() >= 300) {
+    console.error('Cloud Run error:', resp.getResponseCode(), resp.getContentText());
+  }
+}
+
+/**
+ * Mint a Google-signed OIDC ID token for the given service account and audience (Cloud Run URL).
+ * Uses IAM Service Account Credentials API: projects.serviceAccounts.generateIdToken. :contentReference[oaicite:6]{index=6}
+ */
+function generateIdTokenForCloudRun_(serviceAccountEmail, audience) {
+  const url = `https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/${encodeURIComponent(serviceAccountEmail)}:generateIdToken`;
+  const payload = {
+    audience: audience,        // Must be the Cloud Run service URL; custom domains not supported as 'aud'. :contentReference[oaicite:7]{index=7}
+    includeEmail: true
+  };
+  const headers = { Authorization: 'Bearer ' + ScriptApp.getOAuthToken() };
+  const resp = UrlFetchApp.fetch(url, {
+    method: 'post',
+    contentType: 'application/json',
+    payload: JSON.stringify(payload),
+    headers: headers,
+    muteHttpExceptions: false
+  });
+  const data = JSON.parse(resp.getContentText());
+  return data.token;
+}
+
+/** Compute a stable SHA-256 of the 2D values. */
+function sha256_(values2d) {
+  const flat = values2d.map(r => (r.map(c => String(c).trim()).join('\t'))).join('\n') + '\n';
+  const bytes = Utilities.newBlob(flat).getBytes();
+  const digest = Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256, bytes); // built-in digest support :contentReference[oaicite:8]{index=8}
+  return digest.map(b => ('0' + (b & 0xff).toString(16)).slice(-2)).join('');
+}
