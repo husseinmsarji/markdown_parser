@@ -1,128 +1,135 @@
 /**
- * Apps Script bound to your spreadsheet.
- * On every change, read A:B and POST to Cloud Run /ingest with an OIDC ID token minted
- * via the IAM Credentials API (no API keys, no refresh tokens).
- *
- * Security:
- * - Cloud Run is private (--no-allow-unauthenticated).
- * - This script mints a short-lived ID token for SERVICE_ACCOUNT_EMAIL and passes it in
- *   Authorization: Bearer <id_token>. The SA must have roles/run.invoker on the service.
- * - The executing user/group must have iam.serviceAccountTokenCreator on that SA.
- *
- * Scopes (see appsscript.json):
- * - https://www.googleapis.com/auth/script.external_request  (UrlFetchApp)
- * - https://www.googleapis.com/auth/cloud-platform           (call IAM Credentials API)
+ * Minimal "Sheet → GCS" autosync.
+ * - Exports the whole spreadsheet as XLSX (all tabs) OR one tab as CSV.
+ * - Replaces gs://<bucket>/<objectName> on each edit.
+ * - Throttles to once per minute to avoid over-triggering.
  */
-
 const CONFIG = {
-  // Cloud Run default URL (no custom domain; audience must be service URL). :contentReference[oaicite:5]{index=5}
-  CLOUD_RUN_URL: 'https://<your-service>-<hash>-<region>.a.run.app',
-  INGEST_PATH: '/ingest',
-
-  // Service account to impersonate for ID token minting
-  SERVICE_ACCOUNT_EMAIL: 'sa-apps-script-invoker@<PROJECT_ID>.iam.gserviceaccount.com',
-
-  // Sheet settings
-  SHEET_NAME: 'Acronyms', // or leave null to use active sheet
-  RANGE: 'A:B',
-  HAS_HEADER: true,
-
-  // Debounce settings to avoid bursts (ms)
-  MIN_INTERVAL_MS: 8000,
+  BUCKET: 'YOUR_BUCKET_NAME',              // <-- change
+  OBJECT_NAME: 'exports/my-sheet.xlsx',    // <-- change (use .xlsx or .csv)
+  EXPORT_FORMAT: 'XLSX',                   // 'XLSX' or 'CSV'
+  CSV_SHEET_NAME: 'Sheet1',                // used only when EXPORT_FORMAT === 'CSV'
+  MIN_INTERVAL_SECONDS: 60                 // simple debounce
 };
 
-function onOpen() {
-  SpreadsheetApp.getUi().createMenu('Acronym RAG').addItem('Install On‑Change Trigger', 'installTrigger').addToUi();
+// Run once to create the trigger.
+function setup() {
+  const ssId = SpreadsheetApp.getActiveSpreadsheet().getId();
+  // Idempotent trigger creation
+  ScriptApp.getProjectTriggers()
+    .filter(t => t.getHandlerFunction() === 'exportAndUpload')
+    .forEach(t => ScriptApp.deleteTrigger(t));
+  ScriptApp.newTrigger('exportAndUpload')
+    .forSpreadsheet(ssId)
+    .onEdit()                               // fires when a cell value changes
+    .create();
+  Logger.log('Trigger created. Edit the sheet to test.');
 }
 
-function installTrigger() {
-  // Remove previous triggers
-  ScriptApp.getProjectTriggers().forEach(t => ScriptApp.deleteTrigger(t));
-  // Install "On change" trigger
-  ScriptApp.newTrigger('onChange').forSpreadsheet(SpreadsheetApp.getActive()).onChange().create();
-  SpreadsheetApp.getActive().toast('On‑Change trigger installed.');
-}
-
-function onChange(e) {
+// Main handler – runs on edits (installable trigger).
+function exportAndUpload(e) {
+  const lock = LockService.getDocumentLock();
+  lock.waitLock(30000);
   try {
-    // Simple debounce via script properties
-    const props = PropertiesService.getScriptProperties();
-    const now = Date.now();
-    const last = Number(props.getProperty('lastRunTs') || '0');
-    if (now - last < CONFIG.MIN_INTERVAL_MS) {
-      return;
+    if (!shouldRun_()) return; // debounce
+
+    const blob = getExportBlob_();
+    const changed = updateIfChanged_(blob);
+
+    PropertiesService.getDocumentProperties()
+      .setProperty('lastRun', String(Date.now()));
+    if (changed) {
+      Logger.log('Uploaded: gs://%s/%s (%s bytes)',
+        CONFIG.BUCKET, CONFIG.OBJECT_NAME, blob.getBytes().length);
+    } else {
+      Logger.log('No content change detected; skipped upload.');
     }
-    props.setProperty('lastRunTs', String(now));
-
-    notifyCloudRun_();
-  } catch (err) {
-    console.error(err);
+  } finally {
+    lock.releaseLock();
   }
 }
 
-function notifyCloudRun_() {
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
-  const sheet = CONFIG.SHEET_NAME ? ss.getSheetByName(CONFIG.SHEET_NAME) : ss.getActiveSheet();
-  if (!sheet) throw new Error('Sheet not found: ' + CONFIG.SHEET_NAME);
+// Export spreadsheet as XLSX (all tabs) or CSV (single tab) and return a Blob.
+function getExportBlob_() {
+  const ssId = SpreadsheetApp.getActiveSpreadsheet().getId();
+  const token = ScriptApp.getOAuthToken();
 
-  const range = sheet.getRange(CONFIG.RANGE);
-  const values = range.getValues(); // 2D array
-
-  // Optional: client-side hash to help server skip work
-  const sourceHash = sha256_(values);
-
-  const body = {
-    spreadsheetId: ss.getId(),
-    sheetName: sheet.getName(),
-    range: CONFIG.RANGE,
-    hasHeader: CONFIG.HAS_HEADER,
-    values: values,
-    sourceHash: sourceHash,
-    ts: new Date().toISOString(),
-  };
-
-  const idToken = generateIdTokenForCloudRun_(CONFIG.SERVICE_ACCOUNT_EMAIL, CONFIG.CLOUD_RUN_URL);
-  const url = CONFIG.CLOUD_RUN_URL + CONFIG.INGEST_PATH;
-
-  const resp = UrlFetchApp.fetch(url, {
-    method: 'post',
-    contentType: 'application/json',
-    payload: JSON.stringify(body),
-    headers: { 'Authorization': 'Bearer ' + idToken },
-    muteHttpExceptions: true,
-  });
-
-  if (resp.getResponseCode() >= 300) {
-    console.error('Cloud Run error:', resp.getResponseCode(), resp.getContentText());
+  if (CONFIG.EXPORT_FORMAT === 'XLSX') {
+    // Official Drive v3 export endpoint (10 MB export limit).
+    const url = 'https://www.googleapis.com/drive/v3/files/' + ssId +
+      '/export?mimeType=application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
+    const resp = UrlFetchApp.fetch(url, {
+      headers: { Authorization: 'Bearer ' + token },
+      muteHttpExceptions: true
+    });
+    if (resp.getResponseCode() !== 200) {
+      throw new Error('Drive export failed: ' +
+        resp.getResponseCode() + ' ' + resp.getContentText());
+    }
+    return resp.getBlob().setName(fileBaseName_() + '.xlsx');
   }
+
+  if (CONFIG.EXPORT_FORMAT === 'CSV') {
+    // Mirrors "File → Download → CSV (current sheet)" using the tab's gid.
+    const sh = SpreadsheetApp.getActive().getSheetByName(CONFIG.CSV_SHEET_NAME);
+    if (!sh) throw new Error('Sheet not found: ' + CONFIG.CSV_SHEET_NAME);
+    const gid = sh.getSheetId();
+    const url = 'https://docs.google.com/spreadsheets/d/' + ssId +
+      '/export?format=csv&gid=' + gid;
+    const resp = UrlFetchApp.fetch(url, {
+      headers: { Authorization: 'Bearer ' + token },
+      muteHttpExceptions: true
+    });
+    if (resp.getResponseCode() !== 200) {
+      throw new Error('CSV export failed: ' +
+        resp.getResponseCode() + ' ' + resp.getContentText());
+    }
+    return resp.getBlob().setName(fileBaseName_() + '.csv');
+  }
+
+  throw new Error('Unsupported EXPORT_FORMAT: ' + CONFIG.EXPORT_FORMAT);
 }
 
-/**
- * Mint a Google-signed OIDC ID token for the given service account and audience (Cloud Run URL).
- * Uses IAM Service Account Credentials API: projects.serviceAccounts.generateIdToken. :contentReference[oaicite:6]{index=6}
- */
-function generateIdTokenForCloudRun_(serviceAccountEmail, audience) {
-  const url = `https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/${encodeURIComponent(serviceAccountEmail)}:generateIdToken`;
-  const payload = {
-    audience: audience,        // Must be the Cloud Run service URL; custom domains not supported as 'aud'. :contentReference[oaicite:7]{index=7}
-    includeEmail: true
-  };
-  const headers = { Authorization: 'Bearer ' + ScriptApp.getOAuthToken() };
-  const resp = UrlFetchApp.fetch(url, {
+// Upload to GCS only when the content actually changed (hash compare).
+function updateIfChanged_(blob) {
+  const props = PropertiesService.getDocumentProperties();
+  const hash = Utilities.base64Encode(
+    Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256, blob.getBytes())
+  );
+  const lastHash = props.getProperty('lastHash');
+  if (lastHash === hash) return false;
+
+  const uploadUrl = 'https://www.googleapis.com/upload/storage/v1/b/' +
+    encodeURIComponent(CONFIG.BUCKET) + '/o?uploadType=media&name=' +
+    encodeURIComponent(CONFIG.OBJECT_NAME);
+
+  const resp = UrlFetchApp.fetch(uploadUrl, {
     method: 'post',
-    contentType: 'application/json',
-    payload: JSON.stringify(payload),
-    headers: headers,
-    muteHttpExceptions: false
+    contentType: blob.getContentType(),
+    payload: blob.getBytes(),
+    headers: { Authorization: 'Bearer ' + ScriptApp.getOAuthToken() },
+    muteHttpExceptions: true
   });
-  const data = JSON.parse(resp.getContentText());
-  return data.token;
+  const code = resp.getResponseCode();
+  if (code < 200 || code >= 300) {
+    throw new Error('GCS upload failed: ' + code + ' ' + resp.getContentText());
+  }
+  props.setProperty('lastHash', hash);
+  return true;
 }
 
-/** Compute a stable SHA-256 of the 2D values. */
-function sha256_(values2d) {
-  const flat = values2d.map(r => (r.map(c => String(c).trim()).join('\t'))).join('\n') + '\n';
-  const bytes = Utilities.newBlob(flat).getBytes();
-  const digest = Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256, bytes); // built-in digest support :contentReference[oaicite:8]{index=8}
-  return digest.map(b => ('0' + (b & 0xff).toString(16)).slice(-2)).join('');
+function shouldRun_() {
+  const props = PropertiesService.getDocumentProperties();
+  const last = Number(props.getProperty('lastRun') || 0);
+  const seconds = (Date.now() - last) / 1000;
+  return seconds >= CONFIG.MIN_INTERVAL_SECONDS;
 }
+
+function fileBaseName_() {
+  return SpreadsheetApp.getActiveSpreadsheet()
+    .getName()
+    .replace(/[\\/#?]+/g, '_');
+}
+
+// Optional manual test
+function runOnce() { exportAndUpload(); }
